@@ -4,36 +4,37 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const crypto = require('crypto');
 
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors()); // Allow all origins (your lovable.dev app can connect)
+app.use(cors()); // Allow all origins
 app.use(express.json()); // Parse JSON request bodies
 
-// Rate limiting - prevent abuse
+// Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100 // Max 100 requests per 15 minutes per IP
 });
 app.use(limiter);
 
-// In-memory storage (RAM) - data lost on restart, but works immediately
-let signals = []; // Array of signal objects: {id, title, message, timestamp}
+// In-memory storage
+let signals = []; // Signal objects
+let generatedLicenses = []; // Generated license keys: {key, mentorId, createdAt, active}
 
-// Environment variables (set in Railway)
+// Environment variables
 const MENTOR_TOKEN = process.env.MENTOR_TOKEN || 'default-secret-change-me';
-const LICENSE_KEYS = (process.env.LICENSE_KEYS || '').split(',').map(k => k.trim()).filter(Boolean);
+const SECRET_KEY = process.env.SECRET_KEY || 'default-secret-key';
+const MENTOR_ID = process.env.MENTOR_ID || 'EDF';
 
-// Create HTTP server (needed for WebSocket)
+// Create HTTP server
 const server = http.createServer(app);
 
-// WebSocket server for live signal broadcasting
+// WebSocket server
 const wss = new WebSocketServer({ server, path: '/ws' });
-
-// Track connected clients
 const clients = new Set();
 
 wss.on('connection', (ws) => {
@@ -58,27 +59,108 @@ wss.on('connection', (ws) => {
 function broadcastSignal(signal) {
   const message = JSON.stringify({ type: 'signal', data: signal });
   clients.forEach((client) => {
-    if (client.readyState === 1) { // 1 = OPEN
+    if (client.readyState === 1) {
       client.send(message);
     }
   });
+}
+
+// Generate license key with format: EDF-XXX-XXX
+function generateLicenseKey() {
+  // Generate random characters (uppercase + numbers)
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let segment1 = '';
+  let segment2 = '';
+  
+  for (let i = 0; i < 3; i++) {
+    segment1 += chars.charAt(Math.floor(Math.random() * chars.length));
+    segment2 += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  
+  return `${MENTOR_ID}-${segment1}-${segment2}`;
+}
+
+// Validate license key format and existence
+function validateLicenseKey(key) {
+  // Check format: XXX-XXX-XXX
+  const regex = /^[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
+  if (!regex.test(key)) {
+    return { valid: false, reason: 'Invalid key format' };
+  }
+
+  // Check if key starts with correct mentor ID
+  if (!key.startsWith(MENTOR_ID + '-')) {
+    return { valid: false, reason: 'Invalid mentor ID in key' };
+  }
+
+  // Check if key exists in generated licenses
+  const license = generatedLicenses.find(l => l.key === key);
+  if (!license) {
+    return { valid: false, reason: 'License key not found' };
+  }
+
+  // Check if license is active
+  if (!license.active) {
+    return { valid: false, reason: 'License key is inactive' };
+  }
+
+  return { valid: true, reason: 'Valid license', license };
 }
 
 // ============================
 // ENDPOINTS
 // ============================
 
-// 1. Health check - verify server is running
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
     connectedClients: clients.size,
-    signalsCount: signals.length
+    signalsCount: signals.length,
+    licensesCount: generatedLicenses.length,
+    mentorId: MENTOR_ID
   });
 });
 
-// 2. Validate license key
+// Generate new license key (mentor only)
+app.post('/generateLicense', (req, res) => {
+  const token = req.headers['x-mentor-token'];
+
+  // Verify mentor token
+  if (token !== MENTOR_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
+  }
+
+  // Generate unique key
+  let key = generateLicenseKey();
+  
+  // Ensure uniqueness (very unlikely to collide, but check anyway)
+  while (generatedLicenses.find(l => l.key === key)) {
+    key = generateLicenseKey();
+  }
+
+  // Store license
+  const license = {
+    key,
+    mentorId: MENTOR_ID,
+    createdAt: new Date().toISOString(),
+    active: true
+  };
+
+  generatedLicenses.push(license);
+
+  console.log(`🔑 New license generated: ${key}`);
+
+  res.json({ 
+    success: true, 
+    licenseKey: key,
+    mentorId: MENTOR_ID,
+    createdAt: license.createdAt
+  });
+});
+
+// Validate license key
 app.post('/validateLicense', (req, res) => {
   const { licenseKey } = req.body;
 
@@ -86,20 +168,52 @@ app.post('/validateLicense', (req, res) => {
     return res.json({ valid: false, reason: 'License key is required' });
   }
 
-  // Check if key exists in allowed list
-  const isValid = LICENSE_KEYS.includes(licenseKey);
-
-  res.json({
-    valid: isValid,
-    reason: isValid ? 'Valid license' : 'Invalid license key'
-  });
+  const result = validateLicenseKey(licenseKey);
+  res.json(result);
 });
 
-// 3. Send signal (mentor only - requires token)
+// Deactivate license key (mentor only)
+app.post('/deactivateLicense', (req, res) => {
+  const token = req.headers['x-mentor-token'];
+
+  if (token !== MENTOR_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
+  }
+
+  const { licenseKey } = req.body;
+
+  if (!licenseKey) {
+    return res.status(400).json({ error: 'License key is required' });
+  }
+
+  const license = generatedLicenses.find(l => l.key === licenseKey);
+  
+  if (!license) {
+    return res.status(404).json({ error: 'License key not found' });
+  }
+
+  license.active = false;
+
+  console.log(`❌ License deactivated: ${licenseKey}`);
+
+  res.json({ success: true, message: 'License deactivated' });
+});
+
+// Get all generated licenses (mentor only)
+app.get('/licenses', (req, res) => {
+  const token = req.headers['x-mentor-token'];
+
+  if (token !== MENTOR_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
+  }
+
+  res.json({ licenses: generatedLicenses });
+});
+
+// Send signal (mentor only)
 app.post('/sendSignal', (req, res) => {
   const token = req.headers['x-mentor-token'];
 
-  // Verify mentor token
   if (token !== MENTOR_TOKEN) {
     return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
   }
@@ -110,7 +224,6 @@ app.post('/sendSignal', (req, res) => {
     return res.status(400).json({ error: 'Title and message are required' });
   }
 
-  // Create signal object
   const signal = {
     id: Date.now().toString(),
     title,
@@ -118,21 +231,20 @@ app.post('/sendSignal', (req, res) => {
     timestamp: new Date().toISOString()
   };
 
-  // Store signal (in-memory)
-  signals.unshift(signal); // Add to beginning of array
+  signals.unshift(signal);
 
-  // Keep only last 50 signals
   if (signals.length > 50) {
     signals = signals.slice(0, 50);
   }
 
-  // Broadcast to all connected WebSocket clients
   broadcastSignal(signal);
+
+  console.log(`📡 Signal sent: ${title}`);
 
   res.json({ success: true, signal });
 });
 
-// 4. Get all signals (latest first)
+// Get all signals
 app.get('/signals', (req, res) => {
   res.json({ signals });
 });
@@ -141,5 +253,6 @@ app.get('/signals', (req, res) => {
 server.listen(PORT, () => {
   console.log(`🚀 EdgeFlow Backend running on port ${PORT}`);
   console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}/ws`);
-  console.log(`🔑 Allowed license keys: ${LICENSE_KEYS.length} configured`);
+  console.log(`🔑 Mentor ID: ${MENTOR_ID}`);
+  console.log(`✅ Ready to generate and validate licenses`);
 });
