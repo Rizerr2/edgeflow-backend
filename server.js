@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors()); // Allow all origins
+app.set('trust proxy', 1); // Trust Railway's proxy
 app.use(express.json()); // Parse JSON request bodies
 
 // Rate limiting
