@@ -14,12 +14,18 @@ app.use(cors());
 app.set('trust proxy', 1);
 app.use(express.json());
 
-// Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100
+  windowMs: 15 * 60 * 10000,
+  max: 10000  // Increased from 100 to 10000
 });
-app.use(limiter);
+
+// Exempt VPS endpoints from rate limiting
+app.use((req, res, next) => {
+  if (req.path.startsWith('/vps/') || req.path === '/signals') {
+    return next(); // Skip rate limiter for VPS
+  }
+  limiter(req, res, next);
+});
 
 // Environment variables
 const VPS_API_KEY = process.env.VPS_API_KEY || 'vps-secret-key-change-me';
