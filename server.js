@@ -1,9 +1,10 @@
-// EdgeFlow Backend - Multi-Mentor Signal Broadcasting System (Simplified)
+// EdgeFlow Backend - Multi-Mentor Signal Broadcasting + Student Management
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const fs = require('fs');
 
 // Initialize Express
 const app = express();
@@ -24,10 +25,12 @@ app.use(limiter);
 // Environment variables
 const MENTOR_TOKEN = process.env.MENTOR_TOKEN || 'default-secret-change-me';
 const MENTOR_ID = process.env.MENTOR_ID || 'EDF';
+const VPS_API_KEY = process.env.VPS_API_KEY || 'vps-secret-key-change-me';
 
 // In-memory storage
-let licenseKeys = []; // {key, ea_id, user_id, active, createdAt}
-let signals = []; // {id, ea_id, type, symbol, price, sl, tp, lot_size, comment, timestamp}
+let licenseKeys = [];
+let signals = [];
+let students = []; // NEW: Student management
 
 // Create HTTP server
 const server = http.createServer(app);
@@ -39,11 +42,10 @@ const clients = new Set();
 wss.on('connection', (ws) => {
   console.log('✅ New WebSocket client connected');
   clients.add(ws);
-
-  // Send recent signals to new client
+  
   ws.send(JSON.stringify({ 
     type: 'initial', 
-    signals: signals.slice(0, 20) // Last 20 signals
+    signals: signals.slice(0, 20)
   }));
 
   ws.on('close', () => {
@@ -57,7 +59,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Broadcast signal to all connected clients
+// Broadcast signal
 function broadcastSignal(signal) {
   const message = JSON.stringify({ type: 'signal', data: signal });
   let broadcastCount = 0;
@@ -69,10 +71,10 @@ function broadcastSignal(signal) {
     }
   });
   
-  console.log(`📡 Signal broadcasted to ${broadcastCount} clients`);
+  console.log(`📡 Broadcasted to ${broadcastCount} clients`);
 }
 
-// Generate license key with format: XXX-XXX-XXX
+// Generate license key
 function generateLicenseKey(mentorPrefix) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let segment1 = '';
@@ -87,10 +89,9 @@ function generateLicenseKey(mentorPrefix) {
 }
 
 // ============================
-// ENDPOINTS
+// EXISTING ENDPOINTS
 // ============================
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -98,34 +99,28 @@ app.get('/health', (req, res) => {
     connectedClients: clients.size,
     mentorId: MENTOR_ID,
     licensesCount: licenseKeys.length,
-    signalsCount: signals.length
+    signalsCount: signals.length,
+    studentsCount: students.length
   });
 });
 
-// Generate new license key linked to EA (mentor only)
 app.post('/generateLicense', async (req, res) => {
   const token = req.headers['x-mentor-token'];
-
   if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
+    return res.status(401).json({ error: 'Unauthorized' });
   }
 
   const { ea_id, user_id } = req.body;
-
   if (!ea_id) {
     return res.status(400).json({ error: 'ea_id is required' });
   }
 
   try {
-    // Generate unique key
     let licenseKey = generateLicenseKey(MENTOR_ID);
-    
-    // Check for collisions
     while (licenseKeys.find(l => l.key === licenseKey)) {
       licenseKey = generateLicenseKey(MENTOR_ID);
     }
 
-    // Store license
     const newLicense = {
       key: licenseKey,
       ea_id: ea_id,
@@ -135,8 +130,7 @@ app.post('/generateLicense', async (req, res) => {
     };
 
     licenseKeys.push(newLicense);
-
-    console.log(`🔑 New license generated: ${licenseKey} → EA: ${ea_id}`);
+    console.log(`🔑 License generated: ${licenseKey} → EA: ${ea_id}`);
 
     res.json({ 
       success: true, 
@@ -145,14 +139,12 @@ app.post('/generateLicense', async (req, res) => {
       mentorId: MENTOR_ID,
       createdAt: newLicense.createdAt
     });
-
   } catch (error) {
-    console.error('Error generating license:', error);
+    console.error('Error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Validate license key
 app.post('/validateLicense', (req, res) => {
   const { licenseKey } = req.body;
 
@@ -160,51 +152,40 @@ app.post('/validateLicense', (req, res) => {
     return res.json({ valid: false, reason: 'License key is required' });
   }
 
-  try {
-    // Check format: XXX-XXX-XXX
-    const regex = /^[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
-    if (!regex.test(licenseKey)) {
-      return res.json({ valid: false, reason: 'Invalid key format' });
-    }
-
-    // Check if key exists
-    const license = licenseKeys.find(l => l.key === licenseKey);
-    if (!license) {
-      return res.json({ valid: false, reason: 'License key not found' });
-    }
-
-    if (!license.active) {
-      return res.json({ valid: false, reason: 'License key is inactive' });
-    }
-
-    res.json({
-      valid: true,
-      reason: 'Valid license',
-      license: {
-        key: license.key,
-        ea_id: license.ea_id,
-        active: license.active,
-        createdAt: license.createdAt
-      }
-    });
-
-  } catch (error) {
-    console.error('Error validating license:', error);
-    res.status(500).json({ error: 'Internal server error' });
+  const regex = /^[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
+  if (!regex.test(licenseKey)) {
+    return res.json({ valid: false, reason: 'Invalid key format' });
   }
+
+  const license = licenseKeys.find(l => l.key === licenseKey);
+  if (!license) {
+    return res.json({ valid: false, reason: 'License key not found' });
+  }
+
+  if (!license.active) {
+    return res.json({ valid: false, reason: 'License key is inactive' });
+  }
+
+  res.json({
+    valid: true,
+    reason: 'Valid license',
+    license: {
+      key: license.key,
+      ea_id: license.ea_id,
+      active: license.active,
+      createdAt: license.createdAt
+    }
+  });
 });
 
-// Receive signal from MT5 EA (mentor only)
 app.post('/receiveSignal', (req, res) => {
   const token = req.headers['x-mentor-token'];
-
   if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
+    return res.status(401).json({ error: 'Unauthorized' });
   }
 
   const { ea_id, type, symbol, entry_price, sl, tp, lot_size, comment } = req.body;
 
-  // Validate required fields
   if (!ea_id || !type || !symbol || !sl || !tp) {
     return res.status(400).json({ 
       error: 'Missing required fields',
@@ -213,7 +194,6 @@ app.post('/receiveSignal', (req, res) => {
   }
 
   try {
-    // Create signal
     const newSignal = {
       id: Date.now().toString(),
       ea_id: ea_id,
@@ -227,15 +207,12 @@ app.post('/receiveSignal', (req, res) => {
       timestamp: new Date().toISOString()
     };
 
-    // Store signal (keep last 100)
     signals.unshift(newSignal);
     if (signals.length > 100) {
       signals = signals.slice(0, 100);
     }
 
-    console.log(`📊 Signal received: ${type} ${symbol} @ ${entry_price} → EA: ${ea_id}`);
-
-    // Broadcast to WebSocket clients
+    console.log(`📊 Signal: ${type} ${symbol} @ ${entry_price} → EA: ${ea_id}`);
     broadcastSignal(newSignal);
 
     res.json({ 
@@ -244,79 +221,172 @@ app.post('/receiveSignal', (req, res) => {
       ea_id: newSignal.ea_id,
       broadcasted: true
     });
-
   } catch (error) {
-    console.error('Error processing signal:', error);
+    console.error('Error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get signals for specific EA
 app.get('/signals/:ea_id', (req, res) => {
   const { ea_id } = req.params;
-
-  try {
-    const eaSignals = signals.filter(s => s.ea_id === ea_id);
-    res.json({ signals: eaSignals });
-  } catch (error) {
-    console.error('Error fetching signals:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  const eaSignals = signals.filter(s => s.ea_id === ea_id);
+  res.json({ signals: eaSignals });
 });
 
-// Get all signals
 app.get('/signals', (req, res) => {
   res.json({ signals });
 });
 
-// Deactivate license key (mentor only)
-app.post('/deactivateLicense', (req, res) => {
-  const token = req.headers['x-mentor-token'];
+// ============================
+// NEW: STUDENT MANAGEMENT ENDPOINTS
+// ============================
 
-  if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
+// Register new student (submit MT5 credentials)
+app.post('/student/register', (req, res) => {
+  const { 
+    license_key, 
+    account_number, 
+    password, 
+    server, 
+    broker,
+    lot_multiplier 
+  } = req.body;
+
+  // Validate required fields
+  if (!license_key || !account_number || !password || !server) {
+    return res.status(400).json({ 
+      error: 'Missing required fields',
+      required: ['license_key', 'account_number', 'password', 'server']
+    });
   }
 
-  const { licenseKey } = req.body;
-
-  if (!licenseKey) {
-    return res.status(400).json({ error: 'License key is required' });
+  // Validate license key
+  const license = licenseKeys.find(l => l.key === license_key && l.active);
+  if (!license) {
+    return res.status(403).json({ error: 'Invalid or inactive license key' });
   }
 
-  try {
-    const license = licenseKeys.find(l => l.key === licenseKey);
-    
-    if (!license) {
-      return res.status(404).json({ error: 'License key not found' });
-    }
-
-    license.active = false;
-
-    console.log(`❌ License deactivated: ${licenseKey}`);
-
-    res.json({ success: true, message: 'License deactivated' });
-
-  } catch (error) {
-    console.error('Error deactivating license:', error);
-    res.status(500).json({ error: 'Internal server error' });
+  // Check if student already registered
+  const existing = students.find(s => s.license_key === license_key);
+  if (existing) {
+    return res.status(409).json({ error: 'License key already registered' });
   }
+
+  // Add student
+  const student = {
+    license_key,
+    account_number,
+    password, // In production, encrypt this!
+    server,
+    broker: broker || 'Unknown',
+    ea_id: license.ea_id,
+    lot_multiplier: lot_multiplier || 1.0,
+    status: 'pending',
+    registered_at: new Date().toISOString()
+  };
+
+  students.push(student);
+  console.log(`👤 Student registered: ${license_key}`);
+
+  res.json({
+    success: true,
+    message: 'Student registered successfully',
+    license_key: license_key,
+    status: 'pending'
+  });
 });
 
-// Get all licenses (mentor only)
-app.get('/licenses', (req, res) => {
-  const token = req.headers['x-mentor-token'];
+// Start copy trading for student
+app.post('/student/start', (req, res) => {
+  const { license_key } = req.body;
 
-  if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized - invalid mentor token' });
+  if (!license_key) {
+    return res.status(400).json({ error: 'license_key is required' });
   }
 
-  res.json({ licenses: licenseKeys });
+  const student = students.find(s => s.license_key === license_key);
+  if (!student) {
+    return res.status(404).json({ error: 'Student not found' });
+  }
+
+  student.status = 'active';
+  student.started_at = new Date().toISOString();
+
+  console.log(`▶️ Copy trading started: ${license_key}`);
+
+  res.json({
+    success: true,
+    message: 'Copy trading started',
+    status: 'active'
+  });
+});
+
+// Stop copy trading
+app.post('/student/stop', (req, res) => {
+  const { license_key } = req.body;
+
+  if (!license_key) {
+    return res.status(400).json({ error: 'license_key is required' });
+  }
+
+  const student = students.find(s => s.license_key === license_key);
+  if (!student) {
+    return res.status(404).json({ error: 'Student not found' });
+  }
+
+  student.status = 'stopped';
+  student.stopped_at = new Date().toISOString();
+
+  console.log(`⏸️ Copy trading stopped: ${license_key}`);
+
+  res.json({
+    success: true,
+    message: 'Copy trading stopped',
+    status: 'stopped'
+  });
+});
+
+// Get student status
+app.get('/student/status/:license_key', (req, res) => {
+  const { license_key } = req.params;
+
+  const student = students.find(s => s.license_key === license_key);
+  if (!student) {
+    return res.status(404).json({ error: 'Student not found' });
+  }
+
+  res.json({
+    license_key: student.license_key,
+    status: student.status,
+    broker: student.broker,
+    server: student.server,
+    account_number: student.account_number,
+    lot_multiplier: student.lot_multiplier,
+    registered_at: student.registered_at,
+    ea_id: student.ea_id
+  });
+});
+
+// VPS: Get active students (for VPS manager to sync)
+app.get('/vps/students', (req, res) => {
+  const apiKey = req.headers['x-vps-api-key'];
+  
+  if (apiKey !== VPS_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const activeStudents = students.filter(s => s.status === 'active');
+  
+  res.json({
+    students: activeStudents,
+    count: activeStudents.length
+  });
 });
 
 // Start server
 server.listen(PORT, () => {
   console.log(`🚀 EdgeFlow Backend running on port ${PORT}`);
-  console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}/ws`);
+  console.log(`📡 WebSocket: ws://localhost:${PORT}/ws`);
   console.log(`🔑 Mentor ID: ${MENTOR_ID}`);
-  console.log(`✅ Multi-mentor signal system ready (in-memory storage)`);
+  console.log(`✅ Student management enabled`);
 });
