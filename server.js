@@ -22,15 +22,25 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // Environment variables
-const MENTOR_TOKEN = process.env.MENTOR_TOKEN || 'default-secret-change-me';
-const MENTOR_ID = process.env.MENTOR_ID || 'EDF';
 const VPS_API_KEY = process.env.VPS_API_KEY || 'vps-secret-key-change-me';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin-super-secret-key-123';
 console.log('🔑 VPS_API_KEY loaded:', VPS_API_KEY);
 
 // In-memory storage
+let mentors = []; // NEW: Store multiple mentors
 let licenseKeys = [];
 let signals = [];
 let students = [];
+
+// Helper: Generate mentor token
+function generateMentorToken() {
+  return 'MTK-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+}
+
+// Helper: Validate mentor token
+function validateMentorToken(token) {
+  return mentors.find(m => m.token === token);
+}
 
 // Create HTTP server
 const server = http.createServer(app);
@@ -96,10 +106,83 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     timestamp: new Date().toISOString(),
     connectedClients: clients.size,
-    mentorId: MENTOR_ID,
+    mentorsCount: mentors.length,
     licensesCount: licenseKeys.length,
     signalsCount: signals.length,
     studentsCount: students.length
+  });
+});
+
+// ============================
+// MENTOR REGISTRATION
+// ============================
+app.post('/mentor/register', (req, res) => {
+  const { name, email, mentor_id } = req.body;
+
+  if (!name || !email) {
+    return res.status(400).json({ 
+      error: 'Missing required fields',
+      required: ['name', 'email']
+    });
+  }
+
+  // Check if mentor already exists
+  const existing = mentors.find(m => m.email === email);
+  if (existing) {
+    return res.json({ 
+      success: true,
+      already_registered: true,
+      mentor_token: existing.token,
+      mentor_id: existing.mentor_id
+    });
+  }
+
+  // Generate unique mentor token
+  const mentorToken = generateMentorToken();
+  const mentorIdGenerated = mentor_id || 'MNT' + Math.random().toString(36).substring(2, 6).toUpperCase();
+
+  const newMentor = {
+    id: Date.now().toString(),
+    mentor_id: mentorIdGenerated,
+    token: mentorToken,
+    name: name,
+    email: email,
+    created_at: new Date().toISOString(),
+    active: true
+  };
+
+  mentors.push(newMentor);
+  console.log(`👨‍🏫 Mentor registered: ${name} (${mentorIdGenerated})`);
+
+  res.json({
+    success: true,
+    mentor_token: mentorToken,
+    mentor_id: mentorIdGenerated,
+    message: 'Mentor registered successfully'
+  });
+});
+
+app.get('/mentor/verify', (req, res) => {
+  const token = req.headers['x-mentor-token'];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  const mentor = validateMentorToken(token);
+  
+  if (!mentor) {
+    return res.status(401).json({ error: 'Invalid mentor token' });
+  }
+
+  res.json({
+    valid: true,
+    mentor: {
+      mentor_id: mentor.mentor_id,
+      name: mentor.name,
+      email: mentor.email,
+      created_at: mentor.created_at
+    }
   });
 });
 
