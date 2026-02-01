@@ -25,6 +25,7 @@ app.use(limiter);
 const MENTOR_TOKEN = process.env.MENTOR_TOKEN || 'default-secret-change-me';
 const MENTOR_ID = process.env.MENTOR_ID || 'EDF';
 const VPS_API_KEY = process.env.VPS_API_KEY || 'vps-secret-key-change-me';
+console.log('🔑 VPS_API_KEY loaded:', VPS_API_KEY);
 
 // In-memory storage
 let licenseKeys = [];
