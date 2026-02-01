@@ -407,8 +407,22 @@ app.get('/student/status/:license_key', (req, res) => {
 app.get('/vps/students', (req, res) => {
   const apiKey = req.headers['x-vps-api-key'];
   
+  console.log('=== VPS STUDENTS DEBUG ===');
+  console.log('Received headers:', JSON.stringify(req.headers));
+  console.log('Received API Key:', apiKey);
+  console.log('Expected API Key:', VPS_API_KEY);
+  console.log('Match:', apiKey === VPS_API_KEY);
+  
   if (apiKey !== VPS_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({ 
+      error: 'Unauthorized',
+      debug: {
+        received: apiKey,
+        expected: VPS_API_KEY,
+        receivedLength: apiKey ? apiKey.length : 0,
+        expectedLength: VPS_API_KEY.length
+      }
+    });
   }
 
   const activeStudents = students.filter(s => s.status === 'active');
