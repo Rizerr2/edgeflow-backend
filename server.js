@@ -27,7 +27,7 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin-super-secret-key-123';
 console.log('🔑 VPS_API_KEY loaded:', VPS_API_KEY);
 
 // In-memory storage
-let mentors = []; // NEW: Store multiple mentors
+let mentors = [];
 let licenseKeys = [];
 let signals = [];
 let students = [];
@@ -191,8 +191,10 @@ app.get('/mentor/verify', (req, res) => {
 // ============================
 app.post('/generateLicense', async (req, res) => {
   const token = req.headers['x-mentor-token'];
-  if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  const mentor = validateMentorToken(token);
+  
+  if (!mentor) {
+    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
   }
 
   const { ea_id, user_id } = req.body;
@@ -201,27 +203,28 @@ app.post('/generateLicense', async (req, res) => {
   }
 
   try {
-    let licenseKey = generateLicenseKey(MENTOR_ID);
+    let licenseKey = generateLicenseKey(mentor.mentor_id);
     while (licenseKeys.find(l => l.key === licenseKey)) {
-      licenseKey = generateLicenseKey(MENTOR_ID);
+      licenseKey = generateLicenseKey(mentor.mentor_id);
     }
 
     const newLicense = {
       key: licenseKey,
       ea_id: ea_id,
       user_id: user_id || null,
+      mentor_id: mentor.mentor_id,
       active: true,
       createdAt: new Date().toISOString()
     };
 
     licenseKeys.push(newLicense);
-    console.log(`🔑 License generated: ${licenseKey} → EA: ${ea_id}`);
+    console.log(`🔑 License generated: ${licenseKey} → EA: ${ea_id} → Mentor: ${mentor.mentor_id}`);
 
     res.json({ 
       success: true, 
       licenseKey: licenseKey,
       ea_id: ea_id,
-      mentorId: MENTOR_ID,
+      mentorId: mentor.mentor_id,
       createdAt: newLicense.createdAt
     });
   } catch (error) {
@@ -237,7 +240,7 @@ app.post('/validateLicense', (req, res) => {
     return res.json({ valid: false, reason: 'License key is required' });
   }
 
-  const regex = /^[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
+  const regex = /^[A-Z0-9]{3,4}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
   if (!regex.test(licenseKey)) {
     return res.json({ valid: false, reason: 'Invalid key format' });
   }
@@ -257,6 +260,7 @@ app.post('/validateLicense', (req, res) => {
     license: {
       key: license.key,
       ea_id: license.ea_id,
+      mentor_id: license.mentor_id,
       active: license.active,
       createdAt: license.createdAt
     }
@@ -265,8 +269,10 @@ app.post('/validateLicense', (req, res) => {
 
 app.post('/deactivateLicense', (req, res) => {
   const token = req.headers['x-mentor-token'];
-  if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  const mentor = validateMentorToken(token);
+  
+  if (!mentor) {
+    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
   }
 
   const { licenseKey } = req.body;
@@ -276,17 +282,27 @@ app.post('/deactivateLicense', (req, res) => {
     return res.status(404).json({ error: 'License not found' });
   }
 
+  // Check if this mentor owns this license
+  if (license.mentor_id !== mentor.mentor_id) {
+    return res.status(403).json({ error: 'Not authorized for this license' });
+  }
+
   license.active = false;
   res.json({ success: true, licenseKey: licenseKey });
 });
 
 app.get('/licenses', (req, res) => {
   const token = req.headers['x-mentor-token'];
-  if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  const mentor = validateMentorToken(token);
+  
+  if (!mentor) {
+    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
   }
 
-  res.json({ licenses: licenseKeys });
+  // Only return licenses for this mentor
+  const mentorLicenses = licenseKeys.filter(l => l.mentor_id === mentor.mentor_id);
+  
+  res.json({ licenses: mentorLicenses });
 });
 
 // ============================
@@ -294,8 +310,10 @@ app.get('/licenses', (req, res) => {
 // ============================
 app.post('/receiveSignal', (req, res) => {
   const token = req.headers['x-mentor-token'];
-  if (token !== MENTOR_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  const mentor = validateMentorToken(token);
+  
+  if (!mentor) {
+    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
   }
 
   const { ea_id, type, symbol, entry_price, sl, tp, lot_size, comment } = req.body;
@@ -311,6 +329,7 @@ app.post('/receiveSignal', (req, res) => {
     const newSignal = {
       id: Date.now().toString(),
       ea_id: ea_id,
+      mentor_id: mentor.mentor_id,
       type: type.toUpperCase(),
       symbol: symbol.toUpperCase(),
       price: entry_price || null,
@@ -326,13 +345,14 @@ app.post('/receiveSignal', (req, res) => {
       signals = signals.slice(0, 100);
     }
 
-    console.log(`📊 Signal: ${type} ${symbol} @ ${entry_price} → EA: ${ea_id}`);
+    console.log(`📊 Signal: ${type} ${symbol} @ ${entry_price} → EA: ${ea_id} → Mentor: ${mentor.mentor_id}`);
     broadcastSignal(newSignal);
 
     res.json({ 
       success: true, 
       signal_id: newSignal.id,
       ea_id: newSignal.ea_id,
+      mentor_id: mentor.mentor_id,
       broadcasted: true
     });
   } catch (error) {
@@ -388,6 +408,7 @@ app.post('/student/register', (req, res) => {
     server,
     broker: broker || 'Unknown',
     ea_id: license.ea_id,
+    mentor_id: license.mentor_id,
     lot_multiplier: lot_multiplier || 1.0,
     status: 'pending',
     registered_at: new Date().toISOString(),
@@ -395,7 +416,7 @@ app.post('/student/register', (req, res) => {
   };
 
   students.push(student);
-  console.log(`👤 Student registered: ${license_key}`);
+  console.log(`👤 Student registered: ${license_key} → Mentor: ${license.mentor_id}`);
 
   res.json({
     success: true,
@@ -490,22 +511,8 @@ app.get('/student/status/:license_key', (req, res) => {
 app.get('/vps/students', (req, res) => {
   const apiKey = req.headers['x-vps-api-key'];
   
-  console.log('=== VPS STUDENTS DEBUG ===');
-  console.log('Received headers:', JSON.stringify(req.headers));
-  console.log('Received API Key:', apiKey);
-  console.log('Expected API Key:', VPS_API_KEY);
-  console.log('Match:', apiKey === VPS_API_KEY);
-  
   if (apiKey !== VPS_API_KEY) {
-    return res.status(401).json({ 
-      error: 'Unauthorized',
-      debug: {
-        received: apiKey,
-        expected: VPS_API_KEY,
-        receivedLength: apiKey ? apiKey.length : 0,
-        expectedLength: VPS_API_KEY.length
-      }
-    });
+    return res.status(401).json({ error: 'Unauthorized' });
   }
 
   const activeStudents = students.filter(s => s.status === 'active');
@@ -543,6 +550,6 @@ app.post('/vps/heartbeat', (req, res) => {
 server.listen(PORT, () => {
   console.log(`🚀 EdgeFlow Backend running on port ${PORT}`);
   console.log(`📡 WebSocket: ws://localhost:${PORT}/ws`);
-  console.log(`🔑 Mentor ID: ${MENTOR_ID}`);
+  console.log(`✅ Multi-mentor support enabled`);
   console.log(`✅ VPS heartbeat enabled`);
 });
