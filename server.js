@@ -14,12 +14,12 @@ app.use(cors());
 app.set('trust proxy', 1);
 app.use(express.json());
 
+// Rate limiting with VPS exemption
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 10000,
-  max: 10000  // Increased from 100 to 10000
+  windowMs: 15 * 60 * 1000,
+  max: 1000
 });
 
-// Exempt VPS endpoints from rate limiting
 app.use((req, res, next) => {
   if (req.path.startsWith('/vps/') || req.path === '/signals') {
     return next(); // Skip rate limiter for VPS
@@ -38,14 +38,14 @@ let licenseKeys = [];
 let signals = [];
 let students = [];
 
-// Helper: Generate mentor token
-function generateMentorToken() {
-  return 'MTK-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+// Helper: Generate 5-digit Mentor ID
+function generateMentorId() {
+  return Math.floor(10000 + Math.random() * 90000).toString();
 }
 
-// Helper: Validate mentor token
-function validateMentorToken(token) {
-  return mentors.find(m => m.token === token);
+// Helper: Validate Mentor ID
+function validateMentorId(mentorId) {
+  return mentors.find(m => m.mentor_id === mentorId);
 }
 
 // Create HTTP server
@@ -90,7 +90,7 @@ function broadcastSignal(signal) {
   console.log(`📡 Broadcasted to ${broadcastCount} clients`);
 }
 
-// Generate license key
+// Generate license key with mentor ID prefix
 function generateLicenseKey(mentorPrefix) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let segment1 = '';
@@ -132,25 +132,27 @@ app.post('/mentor/register', (req, res) => {
     });
   }
 
-  // Check if mentor already exists
+  // Check if mentor already exists by email
   const existing = mentors.find(m => m.email === email);
   if (existing) {
     return res.json({ 
       success: true,
       already_registered: true,
-      mentor_token: existing.token,
       mentor_id: existing.mentor_id
     });
   }
 
-  // Generate unique mentor token
-  const mentorToken = generateMentorToken();
-  const mentorIdGenerated = mentor_id || 'MNT' + Math.random().toString(36).substring(2, 6).toUpperCase();
+  // Generate or use provided 5-digit Mentor ID
+  let mentorIdGenerated = mentor_id || generateMentorId();
+  
+  // Ensure uniqueness
+  while (mentors.find(m => m.mentor_id === mentorIdGenerated)) {
+    mentorIdGenerated = generateMentorId();
+  }
 
   const newMentor = {
     id: Date.now().toString(),
     mentor_id: mentorIdGenerated,
-    token: mentorToken,
     name: name,
     email: email,
     created_at: new Date().toISOString(),
@@ -158,27 +160,26 @@ app.post('/mentor/register', (req, res) => {
   };
 
   mentors.push(newMentor);
-  console.log(`👨‍🏫 Mentor registered: ${name} (${mentorIdGenerated})`);
+  console.log(`👨‍🏫 Mentor registered: ${name} (ID: ${mentorIdGenerated})`);
 
   res.json({
     success: true,
-    mentor_token: mentorToken,
     mentor_id: mentorIdGenerated,
     message: 'Mentor registered successfully'
   });
 });
 
 app.get('/mentor/verify', (req, res) => {
-  const token = req.headers['x-mentor-token'];
+  const mentorId = req.headers['x-mentor-id'];
   
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
+  if (!mentorId) {
+    return res.status(401).json({ error: 'No Mentor ID provided' });
   }
 
-  const mentor = validateMentorToken(token);
+  const mentor = validateMentorId(mentorId);
   
   if (!mentor) {
-    return res.status(401).json({ error: 'Invalid mentor token' });
+    return res.status(401).json({ error: 'Invalid Mentor ID' });
   }
 
   res.json({
@@ -196,11 +197,11 @@ app.get('/mentor/verify', (req, res) => {
 // LICENSE MANAGEMENT
 // ============================
 app.post('/generateLicense', async (req, res) => {
-  const token = req.headers['x-mentor-token'];
-  const mentor = validateMentorToken(token);
+  const mentorId = req.headers['x-mentor-id'];
+  const mentor = validateMentorId(mentorId);
   
   if (!mentor) {
-    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
+    return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
   }
 
   const { ea_id, user_id } = req.body;
@@ -246,7 +247,8 @@ app.post('/validateLicense', (req, res) => {
     return res.json({ valid: false, reason: 'License key is required' });
   }
 
-  const regex = /^[A-Z0-9]{3,4}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
+  // Updated regex for numeric Mentor ID format: 12345-ABC-XYZ
+  const regex = /^[0-9]{5}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
   if (!regex.test(licenseKey)) {
     return res.json({ valid: false, reason: 'Invalid key format' });
   }
@@ -274,11 +276,11 @@ app.post('/validateLicense', (req, res) => {
 });
 
 app.post('/deactivateLicense', (req, res) => {
-  const token = req.headers['x-mentor-token'];
-  const mentor = validateMentorToken(token);
+  const mentorId = req.headers['x-mentor-id'];
+  const mentor = validateMentorId(mentorId);
   
   if (!mentor) {
-    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
+    return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
   }
 
   const { licenseKey } = req.body;
@@ -288,7 +290,6 @@ app.post('/deactivateLicense', (req, res) => {
     return res.status(404).json({ error: 'License not found' });
   }
 
-  // Check if this mentor owns this license
   if (license.mentor_id !== mentor.mentor_id) {
     return res.status(403).json({ error: 'Not authorized for this license' });
   }
@@ -298,14 +299,13 @@ app.post('/deactivateLicense', (req, res) => {
 });
 
 app.get('/licenses', (req, res) => {
-  const token = req.headers['x-mentor-token'];
-  const mentor = validateMentorToken(token);
+  const mentorId = req.headers['x-mentor-id'];
+  const mentor = validateMentorId(mentorId);
   
   if (!mentor) {
-    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
+    return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
   }
 
-  // Only return licenses for this mentor
   const mentorLicenses = licenseKeys.filter(l => l.mentor_id === mentor.mentor_id);
   
   res.json({ licenses: mentorLicenses });
@@ -315,11 +315,11 @@ app.get('/licenses', (req, res) => {
 // SIGNAL MANAGEMENT
 // ============================
 app.post('/receiveSignal', (req, res) => {
-  const token = req.headers['x-mentor-token'];
-  const mentor = validateMentorToken(token);
+  const mentorId = req.headers['x-mentor-id'];
+  const mentor = validateMentorId(mentorId);
   
   if (!mentor) {
-    return res.status(401).json({ error: 'Unauthorized - Invalid mentor token' });
+    return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
   }
 
   const { ea_id, type, symbol, entry_price, sl, tp, lot_size, comment } = req.body;
@@ -386,8 +386,7 @@ app.post('/student/register', (req, res) => {
     account_number, 
     password, 
     server, 
-    broker,
-    lot_multiplier 
+    broker
   } = req.body;
 
   if (!license_key || !account_number || !password || !server) {
@@ -415,8 +414,7 @@ app.post('/student/register', (req, res) => {
     broker: broker || 'Unknown',
     ea_id: license.ea_id,
     mentor_id: license.mentor_id,
-    lot_multiplier: lot_multiplier || 1.0,
-    status: 'pending',
+    status: 'active',
     registered_at: new Date().toISOString(),
     vps_status: null
   };
@@ -428,7 +426,7 @@ app.post('/student/register', (req, res) => {
     success: true,
     message: 'Student registered successfully',
     license_key: license_key,
-    status: 'pending'
+    status: 'active'
   });
 });
 
@@ -504,7 +502,6 @@ app.get('/student/status/:license_key', (req, res) => {
     broker: student.broker,
     server: student.server,
     account_number: student.account_number,
-    lot_multiplier: student.lot_multiplier,
     registered_at: student.registered_at,
     vps_connected: vps_connected,
     last_heartbeat: student.vps_status?.last_heartbeat || null
@@ -556,6 +553,7 @@ app.post('/vps/heartbeat', (req, res) => {
 server.listen(PORT, () => {
   console.log(`🚀 EdgeFlow Backend running on port ${PORT}`);
   console.log(`📡 WebSocket: ws://localhost:${PORT}/ws`);
-  console.log(`✅ Multi-mentor support enabled`);
+  console.log(`✅ Multi-mentor support enabled (Numeric IDs)`);
   console.log(`✅ VPS heartbeat enabled`);
+  console.log(`✅ Lot size managed in client app`);
 });
