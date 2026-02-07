@@ -1,9 +1,10 @@
-// EdgeFlow Backend - Multi-Mentor Signal Broadcasting + Student Management + VPS Heartbeat
+// EdgeFlow Backend - Multi-Mentor Signal Broadcasting + MetaApi Integration
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const MetaApi = require('metaapi.cloud-sdk').default;
 
 // Initialize Express
 const app = express();
@@ -22,7 +23,7 @@ const limiter = rateLimit({
 
 app.use((req, res, next) => {
   if (req.path.startsWith('/vps/') || req.path === '/signals') {
-    return next(); // Skip rate limiter for VPS
+    return next();
   }
   limiter(req, res, next);
 });
@@ -30,7 +31,18 @@ app.use((req, res, next) => {
 // Environment variables
 const VPS_API_KEY = process.env.VPS_API_KEY || 'vps-secret-key-change-me';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin-super-secret-key-123';
+const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
+
 console.log('🔑 VPS_API_KEY loaded:', VPS_API_KEY);
+
+// Initialize MetaApi
+let metaApi = null;
+if (METAAPI_TOKEN) {
+  metaApi = new MetaApi(METAAPI_TOKEN);
+  console.log('✅ MetaApi initialized');
+} else {
+  console.warn('⚠️ METAAPI_TOKEN not set - student trade execution disabled');
+}
 
 // In-memory storage
 let mentors = [];
@@ -115,7 +127,8 @@ app.get('/health', (req, res) => {
     mentorsCount: mentors.length,
     licensesCount: licenseKeys.length,
     signalsCount: signals.length,
-    studentsCount: students.length
+    studentsCount: students.length,
+    metaApiEnabled: !!metaApi
   });
 });
 
@@ -132,7 +145,6 @@ app.post('/mentor/register', (req, res) => {
     });
   }
 
-  // Check if mentor already exists by email
   const existing = mentors.find(m => m.email === email);
   if (existing) {
     return res.json({ 
@@ -142,10 +154,8 @@ app.post('/mentor/register', (req, res) => {
     });
   }
 
-  // Generate or use provided 5-digit Mentor ID
   let mentorIdGenerated = mentor_id || generateMentorId();
   
-  // Ensure uniqueness
   while (mentors.find(m => m.mentor_id === mentorIdGenerated)) {
     mentorIdGenerated = generateMentorId();
   }
@@ -247,7 +257,6 @@ app.post('/validateLicense', (req, res) => {
     return res.json({ valid: false, reason: 'License key is required' });
   }
 
-  // Updated regex for numeric Mentor ID format: 12345-ABC-XYZ
   const regex = /^[0-9]{5}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
   if (!regex.test(licenseKey)) {
     return res.json({ valid: false, reason: 'Invalid key format' });
@@ -314,7 +323,7 @@ app.get('/licenses', (req, res) => {
 // ============================
 // SIGNAL MANAGEMENT
 // ============================
-app.post('/receiveSignal', (req, res) => {
+app.post('/receiveSignal', async (req, res) => {
   const mentorId = req.headers['x-mentor-id'];
   const mentor = validateMentorId(mentorId);
   
@@ -341,7 +350,7 @@ app.post('/receiveSignal', (req, res) => {
       price: entry_price || null,
       sl: sl,
       tp: tp,
-      lot_size: lot_size || null,
+      lot_size: lot_size || 0.01,
       comment: comment || null,
       timestamp: new Date().toISOString()
     };
@@ -353,6 +362,39 @@ app.post('/receiveSignal', (req, res) => {
 
     console.log(`📊 Signal: ${type} ${symbol} @ ${entry_price} → EA: ${ea_id} → Mentor: ${mentor.mentor_id}`);
     broadcastSignal(newSignal);
+
+    // Execute on students via MetaApi
+    if (metaApi) {
+      const mentorStudents = students.filter(s => 
+        s.mentor_id === mentor.mentor_id && s.status === 'active' && s.metaapi_account_id
+      );
+
+      console.log(`👥 Executing for ${mentorStudents.length} students...`);
+
+      for (const student of mentorStudents) {
+        try {
+          const accountApi = metaApi.metatraderAccountApi;
+          const account = await accountApi.getAccount(student.metaapi_account_id);
+          await account.waitConnected(5000);
+
+          const lotSize = lot_size || 0.01;
+
+          if (type.toUpperCase() === 'BUY') {
+            await account.createMarketBuyOrder(symbol, lotSize, sl, tp, {
+              comment: comment || 'EdgeFlow Copy'
+            });
+          } else {
+            await account.createMarketSellOrder(symbol, lotSize, sl, tp, {
+              comment: comment || 'EdgeFlow Copy'
+            });
+          }
+          
+          console.log(`✅ Trade executed for ${student.license_key}`);
+        } catch (error) {
+          console.error(`❌ Failed for ${student.license_key}:`, error.message);
+        }
+      }
+    }
 
     res.json({ 
       success: true, 
@@ -380,14 +422,8 @@ app.get('/signals', (req, res) => {
 // ============================
 // STUDENT MANAGEMENT
 // ============================
-app.post('/student/register', (req, res) => {
-  const { 
-    license_key, 
-    account_number, 
-    password, 
-    server, 
-    broker
-  } = req.body;
+app.post('/student/register', async (req, res) => {
+  const { license_key, account_number, password, server, broker } = req.body;
 
   if (!license_key || !account_number || !password || !server) {
     return res.status(400).json({ 
@@ -406,28 +442,68 @@ app.post('/student/register', (req, res) => {
     return res.status(409).json({ error: 'License key already registered' });
   }
 
-  const student = {
-    license_key,
-    account_number,
-    password,
-    server,
-    broker: broker || 'Unknown',
-    ea_id: license.ea_id,
-    mentor_id: license.mentor_id,
-    status: 'active',
-    registered_at: new Date().toISOString(),
-    vps_status: null
-  };
+  if (!metaApi) {
+    return res.status(500).json({ error: 'MetaApi not configured. Contact admin.' });
+  }
 
-  students.push(student);
-  console.log(`👤 Student registered: ${license_key} → Mentor: ${license.mentor_id}`);
+  try {
+    console.log(`📝 Creating MetaApi account for ${license_key}...`);
+    
+    const accountApi = metaApi.metatraderAccountApi;
+    const account = await accountApi.createAccount({
+      name: `Student-${license_key}`,
+      type: 'cloud',
+      login: account_number,
+      password: password,
+      server: server,
+      platform: 'mt5',
+      application: 'MetaApi',
+      magic: 0
+    });
 
-  res.json({
-    success: true,
-    message: 'Student registered successfully',
-    license_key: license_key,
-    status: 'active'
-  });
+    console.log(`✅ MetaApi account created: ${account.id}`);
+    await account.deploy();
+    console.log(`🚀 Account deployed, waiting for connection...`);
+    
+    await account.waitConnected(60000);
+    console.log(`✅ MT5 connected successfully`);
+
+    const student = {
+      license_key,
+      account_number,
+      server,
+      broker: broker || 'Unknown',
+      ea_id: license.ea_id,
+      mentor_id: license.mentor_id,
+      metaapi_account_id: account.id,
+      status: 'active',
+      registered_at: new Date().toISOString(),
+      vps_status: {
+        mt5_connected: true,
+        last_heartbeat: new Date().toISOString()
+      }
+    };
+
+    students.push(student);
+    console.log(`👤 Student registered: ${license_key} → Mentor: ${license.mentor_id}`);
+
+    res.json({
+      success: true,
+      message: 'Student registered successfully',
+      license_key: license_key,
+      status: 'active',
+      mt5_connected: true
+    });
+
+  } catch (error) {
+    console.error('❌ MetaApi registration error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to connect MT5 account',
+      details: error.message,
+      hint: 'Check your account number, password, and server name'
+    });
+  }
 });
 
 app.post('/student/start', (req, res) => {
@@ -487,7 +563,6 @@ app.get('/student/status/:license_key', (req, res) => {
     return res.status(404).json({ error: 'Student not found' });
   }
 
-  // Check if VPS heartbeat is recent (< 60 seconds = connected)
   let vps_connected = false;
   if (student.vps_status && student.vps_status.last_heartbeat) {
     const lastHeartbeat = new Date(student.vps_status.last_heartbeat);
@@ -503,13 +578,14 @@ app.get('/student/status/:license_key', (req, res) => {
     server: student.server,
     account_number: student.account_number,
     registered_at: student.registered_at,
-    vps_connected: vps_connected,
-    last_heartbeat: student.vps_status?.last_heartbeat || null
+    vps_connected: vps_connected || (student.metaapi_account_id ? true : false),
+    last_heartbeat: student.vps_status?.last_heartbeat || new Date().toISOString(),
+    metaapi_enabled: !!student.metaapi_account_id
   });
 });
 
 // ============================
-// VPS MANAGEMENT
+// VPS MANAGEMENT (Legacy - kept for backwards compatibility)
 // ============================
 app.get('/vps/students', (req, res) => {
   const apiKey = req.headers['x-vps-api-key'];
@@ -554,6 +630,5 @@ server.listen(PORT, () => {
   console.log(`🚀 EdgeFlow Backend running on port ${PORT}`);
   console.log(`📡 WebSocket: ws://localhost:${PORT}/ws`);
   console.log(`✅ Multi-mentor support enabled (Numeric IDs)`);
-  console.log(`✅ VPS heartbeat enabled`);
-  console.log(`✅ Lot size managed in client app`);
+  console.log(`✅ MetaApi integration: ${metaApi ? 'ENABLED' : 'DISABLED'}`);
 });
