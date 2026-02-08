@@ -625,6 +625,17 @@ app.post('/vps/heartbeat', (req, res) => {
   }
 });
 
+// ADD THIS TO server.js (temporary debug endpoint)
+app.get('/debug/mentors', (req, res) => {
+  res.json({
+    mentors: mentors.map(m => ({
+      mentor_id: m.mentor_id,
+      name: m.name,
+      email: m.email
+    }))
+  });
+});
+
 // Start server
 server.listen(PORT, () => {
   console.log(`🚀 EdgeFlow Backend running on port ${PORT}`);
@@ -632,3 +643,4 @@ server.listen(PORT, () => {
   console.log(`✅ Multi-mentor support enabled (Numeric IDs)`);
   console.log(`✅ MetaApi integration: ${metaApi ? 'ENABLED' : 'DISABLED'}`);
 });
+
