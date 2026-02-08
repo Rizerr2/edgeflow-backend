@@ -1,10 +1,11 @@
-// EdgeFlow Backend - Multi-Mentor Signal Broadcasting + MetaApi Integration
+// EdgeFlow Backend - Multi-Mentor Signal Broadcasting + MetaApi + Supabase Storage
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { WebSocketServer } = require('ws');
 const http = require('http');
 const MetaApi = require('metaapi.cloud-sdk').default;
+const { createClient } = require('@supabase/supabase-js');
 
 // Initialize Express
 const app = express();
@@ -32,8 +33,14 @@ app.use((req, res, next) => {
 const VPS_API_KEY = process.env.VPS_API_KEY || 'vps-secret-key-change-me';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin-super-secret-key-123';
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-console.log('🔑 VPS_API_KEY loaded:', VPS_API_KEY);
+console.log('🔑 Environment check:');
+console.log('  VPS_API_KEY:', VPS_API_KEY ? '✅' : '❌');
+console.log('  METAAPI_TOKEN:', METAAPI_TOKEN ? '✅' : '❌');
+console.log('  SUPABASE_URL:', SUPABASE_URL ? '✅' : '❌');
+console.log('  SUPABASE_SERVICE_KEY:', SUPABASE_SERVICE_KEY ? '✅' : '❌');
 
 // Initialize MetaApi
 let metaApi = null;
@@ -44,8 +51,16 @@ if (METAAPI_TOKEN) {
   console.warn('⚠️ METAAPI_TOKEN not set - student trade execution disabled');
 }
 
-// In-memory storage
-let mentors = [];
+// Initialize Supabase
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+  console.log('✅ Supabase connected');
+} else {
+  console.warn('⚠️ Supabase not configured - mentor storage disabled');
+}
+
+// In-memory storage (for licenses, signals, students)
 let licenseKeys = [];
 let signals = [];
 let students = [];
@@ -55,9 +70,37 @@ function generateMentorId() {
   return Math.floor(10000 + Math.random() * 90000).toString();
 }
 
-// Helper: Validate Mentor ID
-function validateMentorId(mentorId) {
-  return mentors.find(m => m.mentor_id === mentorId);
+// Helper: Validate Mentor ID from Supabase
+async function validateMentorId(mentorId) {
+  if (!supabase) {
+    console.warn('⚠️ Supabase not available, validation failed');
+    return null;
+  }
+  
+  try {
+    const { data, error } = await supabase
+      .from('mentors')
+      .select('*')
+      .eq('mentor_id', mentorId)
+      .eq('active', true)
+      .single();
+    
+    if (error) {
+      console.log('❌ Mentor validation error:', error.message);
+      return null;
+    }
+    
+    if (!data) {
+      console.log('❌ Mentor not found:', mentorId);
+      return null;
+    }
+    
+    console.log('✅ Mentor validated:', mentorId);
+    return data;
+  } catch (error) {
+    console.error('Error validating mentor:', error);
+    return null;
+  }
 }
 
 // Create HTTP server
@@ -119,23 +162,40 @@ function generateLicenseKey(mentorPrefix) {
 // ============================
 // HEALTH CHECK
 // ============================
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  let mentorsCount = 0;
+  
+  if (supabase) {
+    try {
+      const { count, error } = await supabase
+        .from('mentors')
+        .select('*', { count: 'exact', head: true });
+      
+      if (!error) {
+        mentorsCount = count || 0;
+      }
+    } catch (error) {
+      console.error('Error counting mentors:', error);
+    }
+  }
+
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
     connectedClients: clients.size,
-    mentorsCount: mentors.length,
+    mentorsCount: mentorsCount,
     licensesCount: licenseKeys.length,
     signalsCount: signals.length,
     studentsCount: students.length,
-    metaApiEnabled: !!metaApi
+    metaApiEnabled: !!metaApi,
+    supabaseConnected: !!supabase
   });
 });
 
 // ============================
 // MENTOR REGISTRATION
 // ============================
-app.post('/mentor/register', (req, res) => {
+app.post('/mentor/register', async (req, res) => {
   const { name, email, mentor_id } = req.body;
 
   if (!name || !email) {
@@ -145,48 +205,87 @@ app.post('/mentor/register', (req, res) => {
     });
   }
 
-  const existing = mentors.find(m => m.email === email);
-  if (existing) {
-    return res.json({ 
+  if (!supabase) {
+    return res.status(500).json({ error: 'Database not configured' });
+  }
+
+  try {
+    // Check if mentor already exists
+    const { data: existing, error: existError } = await supabase
+      .from('mentors')
+      .select('mentor_id')
+      .eq('email', email)
+      .maybeSingle();
+    
+    if (existing) {
+      console.log('👨‍🏫 Mentor already registered:', existing.mentor_id);
+      return res.json({ 
+        success: true,
+        already_registered: true,
+        mentor_id: existing.mentor_id
+      });
+    }
+
+    // Generate mentor ID if not provided
+    let mentorIdGenerated = mentor_id || generateMentorId();
+    
+    // Check if ID is taken
+    let { data: idCheck } = await supabase
+      .from('mentors')
+      .select('mentor_id')
+      .eq('mentor_id', mentorIdGenerated)
+      .maybeSingle();
+    
+    // Keep generating until unique
+    while (idCheck) {
+      mentorIdGenerated = generateMentorId();
+      const result = await supabase
+        .from('mentors')
+        .select('mentor_id')
+        .eq('mentor_id', mentorIdGenerated)
+        .maybeSingle();
+      idCheck = result.data;
+    }
+
+    // Insert new mentor
+    const { error: insertError } = await supabase
+      .from('mentors')
+      .insert({
+        mentor_id: mentorIdGenerated,
+        name: name,
+        email: email,
+        active: true
+      });
+
+    if (insertError) {
+      console.error('Insert error:', insertError);
+      throw insertError;
+    }
+
+    console.log(`👨‍🏫 Mentor registered: ${name} (ID: ${mentorIdGenerated})`);
+
+    res.json({
       success: true,
-      already_registered: true,
-      mentor_id: existing.mentor_id
+      mentor_id: mentorIdGenerated,
+      message: 'Mentor registered successfully'
+    });
+  } catch (error) {
+    console.error('Mentor registration error:', error);
+    res.status(500).json({ 
+      error: 'Registration failed',
+      details: error.message 
     });
   }
-
-  let mentorIdGenerated = mentor_id || generateMentorId();
-  
-  while (mentors.find(m => m.mentor_id === mentorIdGenerated)) {
-    mentorIdGenerated = generateMentorId();
-  }
-
-  const newMentor = {
-    id: Date.now().toString(),
-    mentor_id: mentorIdGenerated,
-    name: name,
-    email: email,
-    created_at: new Date().toISOString(),
-    active: true
-  };
-
-  mentors.push(newMentor);
-  console.log(`👨‍🏫 Mentor registered: ${name} (ID: ${mentorIdGenerated})`);
-
-  res.json({
-    success: true,
-    mentor_id: mentorIdGenerated,
-    message: 'Mentor registered successfully'
-  });
 });
 
-app.get('/mentor/verify', (req, res) => {
+app.get('/mentor/verify', async (req, res) => {
   const mentorId = req.headers['x-mentor-id'];
   
   if (!mentorId) {
     return res.status(401).json({ error: 'No Mentor ID provided' });
   }
 
-  const mentor = validateMentorId(mentorId);
+  const mentor = await validateMentorId(mentorId);
   
   if (!mentor) {
     return res.status(401).json({ error: 'Invalid Mentor ID' });
@@ -208,9 +307,13 @@ app.get('/mentor/verify', (req, res) => {
 // ============================
 app.post('/generateLicense', async (req, res) => {
   const mentorId = req.headers['x-mentor-id'];
-  const mentor = validateMentorId(mentorId);
+  
+  console.log('🔍 License generation request - Mentor ID:', mentorId);
+  
+  const mentor = await validateMentorId(mentorId);
   
   if (!mentor) {
+    console.log('❌ Invalid Mentor ID:', mentorId);
     return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
   }
 
@@ -284,9 +387,9 @@ app.post('/validateLicense', (req, res) => {
   });
 });
 
-app.post('/deactivateLicense', (req, res) => {
+app.post('/deactivateLicense', async (req, res) => {
   const mentorId = req.headers['x-mentor-id'];
-  const mentor = validateMentorId(mentorId);
+  const mentor = await validateMentorId(mentorId);
   
   if (!mentor) {
     return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
@@ -307,9 +410,9 @@ app.post('/deactivateLicense', (req, res) => {
   res.json({ success: true, licenseKey: licenseKey });
 });
 
-app.get('/licenses', (req, res) => {
+app.get('/licenses', async (req, res) => {
   const mentorId = req.headers['x-mentor-id'];
-  const mentor = validateMentorId(mentorId);
+  const mentor = await validateMentorId(mentorId);
   
   if (!mentor) {
     return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
@@ -325,7 +428,7 @@ app.get('/licenses', (req, res) => {
 // ============================
 app.post('/receiveSignal', async (req, res) => {
   const mentorId = req.headers['x-mentor-id'];
-  const mentor = validateMentorId(mentorId);
+  const mentor = await validateMentorId(mentorId);
   
   if (!mentor) {
     return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
@@ -585,7 +688,7 @@ app.get('/student/status/:license_key', (req, res) => {
 });
 
 // ============================
-// VPS MANAGEMENT (Legacy - kept for backwards compatibility)
+// VPS MANAGEMENT (Legacy)
 // ============================
 app.get('/vps/students', (req, res) => {
   const apiKey = req.headers['x-vps-api-key'];
@@ -625,22 +728,15 @@ app.post('/vps/heartbeat', (req, res) => {
   }
 });
 
-// ADD THIS TO server.js (temporary debug endpoint)
-app.get('/debug/mentors', (req, res) => {
-  res.json({
-    mentors: mentors.map(m => ({
-      mentor_id: m.mentor_id,
-      name: m.name,
-      email: m.email
-    }))
-  });
-});
-
 // Start server
 server.listen(PORT, () => {
-  console.log(`🚀 EdgeFlow Backend running on port ${PORT}`);
-  console.log(`📡 WebSocket: ws://localhost:${PORT}/ws`);
-  console.log(`✅ Multi-mentor support enabled (Numeric IDs)`);
-  console.log(`✅ MetaApi integration: ${metaApi ? 'ENABLED' : 'DISABLED'}`);
+  console.log('════════════════════════════════════════');
+  console.log('🚀 EdgeFlow Backend Started');
+  console.log('════════════════════════════════════════');
+  console.log(`📡 Port: ${PORT}`);
+  console.log(`🌐 WebSocket: ws://localhost:${PORT}/ws`);
+  console.log(`✅ Multi-mentor: ENABLED`);
+  console.log(`✅ MetaApi: ${metaApi ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`✅ Supabase: ${supabase ? 'ENABLED' : 'DISABLED'}`);
+  console.log('════════════════════════════════════════');
 });
-
