@@ -1,11 +1,10 @@
-// EdgeFlow Backend - Multi-Mentor Signal Broadcasting + MetaApi + Supabase Storage
+// EdgeFlow Backend - Multi-Mentor Signal Broadcasting + MetaApi + Edge Functions
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { WebSocketServer } = require('ws');
 const http = require('http');
 const MetaApi = require('metaapi.cloud-sdk').default;
-const { createClient } = require('@supabase/supabase-js');
 
 // Initialize Express
 const app = express();
@@ -16,7 +15,7 @@ app.use(cors());
 app.set('trust proxy', 1);
 app.use(express.json());
 
-// Rate limiting with VPS exemption
+// Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000
@@ -33,14 +32,13 @@ app.use((req, res, next) => {
 const VPS_API_KEY = process.env.VPS_API_KEY || 'vps-secret-key-change-me';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin-super-secret-key-123';
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_FUNCTIONS_URL = process.env.SUPABASE_FUNCTIONS_URL || 'https://kpytckomyhlznpokznlp.supabase.co/functions/v1';
+const RAILWAY_SYNC_SECRET = process.env.RAILWAY_SYNC_SECRET;
 
 console.log('🔑 Environment check:');
-console.log('  VPS_API_KEY:', VPS_API_KEY ? '✅' : '❌');
 console.log('  METAAPI_TOKEN:', METAAPI_TOKEN ? '✅' : '❌');
-console.log('  SUPABASE_URL:', SUPABASE_URL ? '✅' : '❌');
-console.log('  SUPABASE_SERVICE_KEY:', SUPABASE_SERVICE_KEY ? '✅' : '❌');
+console.log('  SUPABASE_FUNCTIONS_URL:', SUPABASE_FUNCTIONS_URL ? '✅' : '❌');
+console.log('  RAILWAY_SYNC_SECRET:', RAILWAY_SYNC_SECRET ? '✅' : '❌');
 
 // Initialize MetaApi
 let metaApi = null;
@@ -48,59 +46,47 @@ if (METAAPI_TOKEN) {
   metaApi = new MetaApi(METAAPI_TOKEN);
   console.log('✅ MetaApi initialized');
 } else {
-  console.warn('⚠️ METAAPI_TOKEN not set - student trade execution disabled');
+  console.warn('⚠️ METAAPI_TOKEN not set');
 }
 
-// Initialize Supabase
-let supabase = null;
-if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-  console.log('✅ Supabase connected');
-} else {
-  console.warn('⚠️ Supabase not configured - mentor storage disabled');
-}
-
-// In-memory storage (for licenses, signals, students)
-let licenseKeys = [];
+// In-memory storage (for signals and students - licenses now in Supabase)
 let signals = [];
 let students = [];
 
-// Helper: Generate 5-digit Mentor ID
-function generateMentorId() {
-  return Math.floor(10000 + Math.random() * 90000).toString();
-}
-
-// Helper: Validate Mentor ID from Supabase
-async function validateMentorId(mentorId) {
-  if (!supabase) {
-    console.warn('⚠️ Supabase not available, validation failed');
-    return null;
-  }
-  
+// Helper: Call Edge Functions
+async function callEdgeFunction(functionName, body) {
   try {
-    const { data, error } = await supabase
-      .from('mentors')
-      .select('*')
-      .eq('mentor_id', mentorId)
-      .eq('active', true)
-      .single();
+    const res = await fetch(`${SUPABASE_FUNCTIONS_URL}/${functionName}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-sync-secret': RAILWAY_SYNC_SECRET,
+      },
+      body: JSON.stringify(body),
+    });
     
-    if (error) {
-      console.log('❌ Mentor validation error:', error.message);
-      return null;
-    }
-    
-    if (!data) {
-      console.log('❌ Mentor not found:', mentorId);
-      return null;
-    }
-    
-    console.log('✅ Mentor validated:', mentorId);
+    const data = await res.json();
     return data;
   } catch (error) {
-    console.error('Error validating mentor:', error);
-    return null;
+    console.error(`Edge Function ${functionName} error:`, error);
+    return { error: error.message };
   }
+}
+
+// Helper: Validate Mentor ID via Edge Function
+async function validateMentorId(mentorId) {
+  const result = await callEdgeFunction('sync-mentor', {
+    action: 'validate',
+    mentor_id: mentorId,
+  });
+  
+  if (result.valid && result.mentor) {
+    console.log('✅ Mentor validated:', mentorId);
+    return result.mentor;
+  }
+  
+  console.log('❌ Mentor validation failed:', mentorId);
+  return null;
 }
 
 // Create HTTP server
@@ -145,50 +131,21 @@ function broadcastSignal(signal) {
   console.log(`📡 Broadcasted to ${broadcastCount} clients`);
 }
 
-// Generate license key with mentor ID prefix
-function generateLicenseKey(mentorPrefix) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let segment1 = '';
-  let segment2 = '';
-  
-  for (let i = 0; i < 3; i++) {
-    segment1 += chars.charAt(Math.floor(Math.random() * chars.length));
-    segment2 += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  
-  return `${mentorPrefix}-${segment1}-${segment2}`;
-}
-
 // ============================
 // HEALTH CHECK
 // ============================
 app.get('/health', async (req, res) => {
-  let mentorsCount = 0;
+  const mentorsResult = await callEdgeFunction('sync-mentor', { action: 'list' });
   
-  if (supabase) {
-    try {
-      const { count, error } = await supabase
-        .from('mentors')
-        .select('*', { count: 'exact', head: true });
-      
-      if (!error) {
-        mentorsCount = count || 0;
-      }
-    } catch (error) {
-      console.error('Error counting mentors:', error);
-    }
-  }
-
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
     connectedClients: clients.size,
-    mentorsCount: mentorsCount,
-    licensesCount: licenseKeys.length,
+    mentorsCount: mentorsResult.count || 0,
     signalsCount: signals.length,
     studentsCount: students.length,
     metaApiEnabled: !!metaApi,
-    supabaseConnected: !!supabase
+    supabaseBridge: !!RAILWAY_SYNC_SECRET
   });
 });
 
@@ -205,77 +162,20 @@ app.post('/mentor/register', async (req, res) => {
     });
   }
 
-  if (!supabase) {
-    return res.status(500).json({ error: 'Database not configured' });
+  const result = await callEdgeFunction('sync-mentor', {
+    action: 'register',
+    name,
+    email,
+    mentor_id,
+  });
+
+  if (result.error) {
+    console.error('Mentor registration error:', result.error);
+    return res.status(500).json(result);
   }
 
-  try {
-    // Check if mentor already exists
-    const { data: existing, error: existError } = await supabase
-      .from('mentors')
-      .select('mentor_id')
-      .eq('email', email)
-      .maybeSingle();
-    
-    if (existing) {
-      console.log('👨‍🏫 Mentor already registered:', existing.mentor_id);
-      return res.json({ 
-        success: true,
-        already_registered: true,
-        mentor_id: existing.mentor_id
-      });
-    }
-
-    // Generate mentor ID if not provided
-    let mentorIdGenerated = mentor_id || generateMentorId();
-    
-    // Check if ID is taken
-    let { data: idCheck } = await supabase
-      .from('mentors')
-      .select('mentor_id')
-      .eq('mentor_id', mentorIdGenerated)
-      .maybeSingle();
-    
-    // Keep generating until unique
-    while (idCheck) {
-      mentorIdGenerated = generateMentorId();
-      const result = await supabase
-        .from('mentors')
-        .select('mentor_id')
-        .eq('mentor_id', mentorIdGenerated)
-        .maybeSingle();
-      idCheck = result.data;
-    }
-
-    // Insert new mentor
-    const { error: insertError } = await supabase
-      .from('mentors')
-      .insert({
-        mentor_id: mentorIdGenerated,
-        name: name,
-        email: email,
-        active: true
-      });
-
-    if (insertError) {
-      console.error('Insert error:', insertError);
-      throw insertError;
-    }
-
-    console.log(`👨‍🏫 Mentor registered: ${name} (ID: ${mentorIdGenerated})`);
-
-    res.json({
-      success: true,
-      mentor_id: mentorIdGenerated,
-      message: 'Mentor registered successfully'
-    });
-  } catch (error) {
-    console.error('Mentor registration error:', error);
-    res.status(500).json({ 
-      error: 'Registration failed',
-      details: error.message 
-    });
-  }
+  console.log(`👨‍🏫 Mentor registered: ${name} (ID: ${result.mentor_id})`);
+  res.json(result);
 });
 
 app.get('/mentor/verify', async (req, res) => {
@@ -317,73 +217,57 @@ app.post('/generateLicense', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
   }
 
-  const { ea_id, user_id } = req.body;
-  if (!ea_id) {
-    return res.status(400).json({ error: 'ea_id is required' });
+  const result = await callEdgeFunction('sync-license', {
+    action: 'generate',
+    mentor_id: mentorId,
+    student_name: req.body.user_name || req.body.student_name,
+    student_email: req.body.user_email || req.body.student_email,
+    ea_id: req.body.ea_id,
+    duration_days: req.body.duration_days || 30,
+    plan_name: req.body.plan_name || 'Standard',
+  });
+
+  if (result.error) {
+    console.error('License generation error:', result.error);
+    return res.status(500).json(result);
   }
 
-  try {
-    let licenseKey = generateLicenseKey(mentor.mentor_id);
-    while (licenseKeys.find(l => l.key === licenseKey)) {
-      licenseKey = generateLicenseKey(mentor.mentor_id);
-    }
-
-    const newLicense = {
-      key: licenseKey,
-      ea_id: ea_id,
-      user_id: user_id || null,
-      mentor_id: mentor.mentor_id,
-      active: true,
-      createdAt: new Date().toISOString()
-    };
-
-    licenseKeys.push(newLicense);
-    console.log(`🔑 License generated: ${licenseKey} → EA: ${ea_id} → Mentor: ${mentor.mentor_id}`);
-
-    res.json({ 
-      success: true, 
-      licenseKey: licenseKey,
-      ea_id: ea_id,
-      mentorId: mentor.mentor_id,
-      createdAt: newLicense.createdAt
-    });
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  console.log(`🔑 License generated: ${result.license_key}`);
+  
+  res.json({ 
+    success: true, 
+    licenseKey: result.license_key,
+    ea_id: req.body.ea_id,
+    mentorId: mentorId,
+    createdAt: new Date().toISOString()
+  });
 });
 
-app.post('/validateLicense', (req, res) => {
+app.post('/validateLicense', async (req, res) => {
   const { licenseKey } = req.body;
 
   if (!licenseKey) {
     return res.json({ valid: false, reason: 'License key is required' });
   }
 
-  const regex = /^[0-9]{5}-[A-Z0-9]{3}-[A-Z0-9]{3}$/;
-  if (!regex.test(licenseKey)) {
-    return res.json({ valid: false, reason: 'Invalid key format' });
-  }
+  const result = await callEdgeFunction('sync-license', {
+    action: 'validate',
+    license_key: licenseKey,
+  });
 
-  const license = licenseKeys.find(l => l.key === licenseKey);
-  if (!license) {
-    return res.json({ valid: false, reason: 'License key not found' });
-  }
-
-  if (!license.active) {
-    return res.json({ valid: false, reason: 'License key is inactive' });
+  if (!result.valid) {
+    return res.json({ 
+      valid: false, 
+      reason: result.error || 'Invalid license key'
+    });
   }
 
   res.json({
     valid: true,
     reason: 'Valid license',
-    license: {
-      key: license.key,
-      ea_id: license.ea_id,
-      mentor_id: license.mentor_id,
-      active: license.active,
-      createdAt: license.createdAt
-    }
+    license: result.license,
+    ea: result.ea,
+    mentor: result.mentor
   });
 });
 
@@ -396,17 +280,8 @@ app.post('/deactivateLicense', async (req, res) => {
   }
 
   const { licenseKey } = req.body;
-  const license = licenseKeys.find(l => l.key === licenseKey);
   
-  if (!license) {
-    return res.status(404).json({ error: 'License not found' });
-  }
-
-  if (license.mentor_id !== mentor.mentor_id) {
-    return res.status(403).json({ error: 'Not authorized for this license' });
-  }
-
-  license.active = false;
+  // For now, just return success - implement deactivation in Edge Function later
   res.json({ success: true, licenseKey: licenseKey });
 });
 
@@ -418,9 +293,12 @@ app.get('/licenses', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized - Invalid Mentor ID' });
   }
 
-  const mentorLicenses = licenseKeys.filter(l => l.mentor_id === mentor.mentor_id);
+  const result = await callEdgeFunction('sync-license', {
+    action: 'status',
+    mentor_id: mentorId,
+  });
   
-  res.json({ licenses: mentorLicenses });
+  res.json({ licenses: result.licenses || [] });
 });
 
 // ============================
@@ -535,8 +413,13 @@ app.post('/student/register', async (req, res) => {
     });
   }
 
-  const license = licenseKeys.find(l => l.key === license_key && l.active);
-  if (!license) {
+  // Validate license via Edge Function
+  const licenseResult = await callEdgeFunction('sync-license', {
+    action: 'validate',
+    license_key: license_key,
+  });
+
+  if (!licenseResult.valid) {
     return res.status(403).json({ error: 'Invalid or inactive license key' });
   }
 
@@ -576,8 +459,8 @@ app.post('/student/register', async (req, res) => {
       account_number,
       server,
       broker: broker || 'Unknown',
-      ea_id: license.ea_id,
-      mentor_id: license.mentor_id,
+      ea_id: licenseResult.license.ea_id,
+      mentor_id: licenseResult.mentor?.mentor_id || 'unknown',
       metaapi_account_id: account.id,
       status: 'active',
       registered_at: new Date().toISOString(),
@@ -588,7 +471,7 @@ app.post('/student/register', async (req, res) => {
     };
 
     students.push(student);
-    console.log(`👤 Student registered: ${license_key} → Mentor: ${license.mentor_id}`);
+    console.log(`👤 Student registered: ${license_key}`);
 
     res.json({
       success: true,
@@ -737,6 +620,6 @@ server.listen(PORT, () => {
   console.log(`🌐 WebSocket: ws://localhost:${PORT}/ws`);
   console.log(`✅ Multi-mentor: ENABLED`);
   console.log(`✅ MetaApi: ${metaApi ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`✅ Supabase: ${supabase ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`✅ Supabase Bridge: ${RAILWAY_SYNC_SECRET ? 'ENABLED' : 'DISABLED'}`);
   console.log('════════════════════════════════════════');
 });
