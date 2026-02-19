@@ -156,18 +156,39 @@ app.post('/receiveSignal', async (req, res) => {
 
     for (const student of mentorStudents) {
       try {
-        const account = await metaApi.metatraderAccountApi.getAccount(student.metaapi_account_id);
-        await account.waitConnected(5000);
+        const accountApi = metaApi.metatraderAccountApi;
+        const account = await accountApi.getAccount(student.metaapi_account_id);
 
-        const lotSize = lot_size || 0.01;
-
-        if (type.toUpperCase() === 'BUY') {
-          await account.createMarketBuyOrder(symbol, lotSize, sl, tp, { comment: comment || 'EdgeFlow' });
-        } else {
-          await account.createMarketSellOrder(symbol, lotSize, sl, tp, { comment: comment || 'EdgeFlow' });
+        // Ensure deployed and connected
+        if (account.state !== 'DEPLOYED') {
+          await account.deploy();
         }
         
-        console.log(`✅ Trade executed for ${student.license_key}`);
+        await account.waitConnected();
+
+        // Get RPC connection
+        const connection = account.getRPCConnection();
+        await connection.connect();
+        await connection.waitSynchronized();
+
+        // Prepare order
+        const orderType = type.toUpperCase() === 'BUY' ? 'ORDER_TYPE_BUY' : 'ORDER_TYPE_SELL';
+        const lotSize = lot_size || 0.01;
+
+        // Place market order
+        const result = await connection.createMarketOrder(
+          symbol,
+          {
+            actionType: orderType,
+            volume: lotSize,
+            stopLoss: sl,
+            takeProfit: tp,
+            comment: comment || 'EdgeFlow Copy'
+          }
+        );
+        
+        console.log(`✅ Trade executed for ${student.license_key} - Order: ${result.orderId}`);
+        
       } catch (error) {
         console.error(`❌ Failed for ${student.license_key}:`, error.message);
       }
@@ -204,7 +225,8 @@ app.post('/student/register', async (req, res) => {
   try {
     console.log(`📝 Creating MetaApi account for ${license_key}...`);
     
-    const account = await metaApi.metatraderAccountApi.createAccount({
+    const accountApi = metaApi.metatraderAccountApi;
+    const account = await accountApi.createAccount({
       name: `Student-${license_key}`,
       type: 'cloud',
       login: account_number,
@@ -255,6 +277,25 @@ app.post('/student/stop', (req, res) => {
   student.status = 'stopped';
   console.log(`⏸️ Stopped: ${req.body.license_key}`);
   res.json({ success: true, status: 'stopped' });
+});
+
+app.get('/student/status/:license_key', (req, res) => {
+  const { license_key } = req.params;
+  const student = students.find(s => s.license_key === license_key);
+  
+  if (!student) {
+    return res.status(404).json({ error: 'Student not found' });
+  }
+
+  res.json({
+    license_key: student.license_key,
+    status: student.status,
+    broker: student.broker,
+    server: student.server,
+    account_number: student.account_number,
+    registered_at: student.registered_at,
+    metaapi_enabled: !!student.metaapi_account_id
+  });
 });
 
 // Start
