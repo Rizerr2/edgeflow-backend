@@ -146,7 +146,7 @@ app.post('/receiveSignal', async (req, res) => {
   console.log(`📊 Signal: ${type} ${symbol} @ ${entry_price} → Mentor: ${mentor.mentor_id}`);
   broadcastSignal(newSignal);
 
-  // Execute on students
+  // Execute on students via MetaApi
   if (metaApi) {
     const mentorStudents = students.filter(s => 
       s.mentor_id === mentor.mentor_id && s.status === 'active' && s.metaapi_account_id
@@ -171,21 +171,32 @@ app.post('/receiveSignal', async (req, res) => {
         await connection.connect();
         await connection.waitSynchronized();
 
-        // Prepare order
-        const orderType = type.toUpperCase() === 'BUY' ? 'ORDER_TYPE_BUY' : 'ORDER_TYPE_SELL';
         const lotSize = lot_size || 0.01;
+        const tradeComment = comment || 'EdgeFlow Copy';
 
-        // Place market order
-        const result = await connection.createMarketOrder(
-          symbol,
-          {
-            actionType: orderType,
-            volume: lotSize,
-            stopLoss: sl,
-            takeProfit: tp,
-            comment: comment || 'EdgeFlow Copy'
-          }
-        );
+        // Place order using correct methods
+        let result;
+        if (type.toUpperCase() === 'BUY') {
+          result = await connection.createMarketBuyOrder(
+            symbol,
+            lotSize,
+            sl,
+            tp,
+            {
+              comment: tradeComment
+            }
+          );
+        } else {
+          result = await connection.createMarketSellOrder(
+            symbol,
+            lotSize,
+            sl,
+            tp,
+            {
+              comment: tradeComment
+            }
+          );
+        }
         
         console.log(`✅ Trade executed for ${student.license_key} - Order: ${result.orderId}`);
         
